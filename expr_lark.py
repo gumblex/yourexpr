@@ -40,9 +40,47 @@ class Function(typing.NamedTuple):
 
     @classmethod
     def from_dict(cls, d):
-        args = tuple(cls.from_dict(x) if isinstance(x, dict) else x
-                     for x in d['args'])
-        return cls(d['name'], args)
+        if not isinstance(d, dict):
+            return d
+        if d['name'] == '_if':
+            if_blocks, else_blocks = d['args']
+            args = (
+                tuple(tuple(map(cls.from_dict, row)) for row in if_blocks),
+                tuple(map(cls.from_dict, else_blocks)),
+            )
+            return IfBlock(d['name'], args)
+        elif d['name'] == '_getitem':
+            obj, items = d['args']
+            args = (cls.from_dict(obj), tuple(map(cls.from_dict, items)))
+            return GetItem(d['name'], args)
+        else:
+            args = tuple(cls.from_dict(x) if isinstance(x, dict) else x
+                         for x in d['args'])
+            return cls(d['name'], args)
+
+
+class IfBlock(Function):
+    # name = '_if'
+
+    def __repr__(self):
+        r = 'if ' + ' elif '.join('(%r){%r}' % row for row in self.args[0])
+        if self.args[1]:
+            r += ' else {%r}' % (self.args[1][0],)
+        return r
+
+    def to_dict(self):
+        if_blocks = [
+            [cond.to_dict(), block.to_dict()] for cond, block in self.args[0]]
+        else_blocks = [block.to_dict() for block in self.args[1]]
+        return {'name': self.name, 'args': [if_blocks, else_blocks]}
+
+
+class GetItem(Function):
+    # name = '_getitem'
+
+    def to_dict(self):
+        items = [item.to_dict() for item in self.args[1]]
+        return {'name': self.name, 'args': [self.args[0], items]}
 
 
 class CallGraphGenerator(lark.Transformer):
@@ -110,7 +148,7 @@ class CallGraphGenerator(lark.Transformer):
         return Function(fn, pargs)
 
     def getitem(self, args):
-        return Function('_getitem', (args[0], tuple(args[1].children)))
+        return GetItem('_getitem', (args[0], tuple(args[1].children)))
 
     def simple_stmt(self, args):
         return Function('_stmts', tuple(args))
@@ -135,7 +173,11 @@ class CallGraphGenerator(lark.Transformer):
                 else_block = arg.children[0]
             else:
                 if_blocks.append(tuple(arg.children))
-        return Function('_if', (tuple(if_blocks), (else_block,)))
+        if else_block:
+            else_arg = (else_block,)
+        else:
+            else_arg = ()
+        return IfBlock('_if', (tuple(if_blocks), else_arg))
 
 
 _graph_generator = CallGraphGenerator()
@@ -205,7 +247,7 @@ class Expression:
             '=': self.assign,
             '_name': self.get_name,
             '_const': self.get_const,
-            '_getitem': operator.getitem,
+            '_getitem': self.get_item,
             '_stmts': self.evaluate_stmts,
             '_if': self.evaluate_if,
         }
@@ -230,6 +272,14 @@ class Expression:
     def __repr__(self):
         return 'Expression(%r)' % (self.tree,)
 
+    def __eq__(self, other):
+        try:
+            return (self.tree == other.tree and
+                    self.vars == other.vars and
+                    self.local_consts == other.local_consts)
+        except AttributeError:
+            return False
+
     @classmethod
     def from_dict(cls, d):
         return cls(Function.from_dict(d))
@@ -250,6 +300,12 @@ class Expression:
         except KeyError:
             raise ExpressionNameError('variable "%s" is not defined' % name)
 
+    def get_item(self, obj, key):
+        if len(key) > 1:
+            return obj[key]
+        else:
+            return obj[key[0]]
+
     def get_const(self, name):
         # config value: {a.b.c}
         return self.local_consts[name]
@@ -257,27 +313,51 @@ class Expression:
     def dependent_vars(self, root=None):
         if root is None:
             root = self.tree
+        elif not isinstance(root, Function):
+            return set()
         depvars = set()
-        for arg in root.args:
-            if isinstance(arg, Function):
-                if arg.name == '_name':
-                    if arg.args[0] not in self.consts:
-                        depvars.add(arg.args[0])
-                else:
+        if root.name == '_name':
+            if root.args[0] not in self.consts:
+                depvars.add(root.args[0])
+        elif root.name == '_if':
+            for cond, block in root.args[0]:
+                depvars.update(self.dependent_vars(cond))
+                depvars.update(self.dependent_vars(block))
+            if root.args[1]:
+                depvars.update(self.dependent_vars(root.args[1][0]))
+        elif root.name == '_getitem':
+            depvars.update(self.dependent_vars(root.args[0]))
+            for arg in root.args[1]:
+                depvars.update(self.dependent_vars(arg))
+        else:
+            for arg in root.args:
+                if isinstance(arg, Function):
                     depvars.update(self.dependent_vars(arg))
         return depvars
 
     def assigned_vars(self, root=None):
         if root is None:
             root = self.tree
+        elif not isinstance(root, Function):
+            return set()
         assigned = set()
-        for arg in root.args:
-            if isinstance(arg, Function):
-                if arg.name == '=':
-                    assigned.add(arg.args[0])
-                else:
+        if root.name == '=':
+            assigned.add(root.args[0])
+        elif root.name == '_if':
+            for block in root.args[0]:
+                assigned.update(self.assigned_vars(block[0]))
+                assigned.update(self.assigned_vars(block[1]))
+            if root.args[1]:
+                assigned.update(self.assigned_vars(root.args[1][0]))
+        else:
+            for arg in root.args:
+                if isinstance(arg, Function):
                     assigned.update(self.assigned_vars(arg))
         return assigned
+
+    def reset(self):
+        self.vars = {}
+        self.local_consts = {}
 
     def evaluate(self, variables=None, consts=None):
         if variables:
@@ -307,7 +387,7 @@ class Expression:
         else:
             # else
             if else_block:
-                self.evaluate_fn(else_block)
+                self.evaluate_fn(else_block[0])
 
     def evaluate_stmts(self, *stmts):
         for st in stmts:
@@ -326,8 +406,10 @@ if __name__ == '__main__':
             try:
                 expr = Expression(s, multi)
                 print(expr.tree)
-                #print(expr.to_dict())
+                print(expr.to_dict())
+                #print(expr.from_dict(expr.to_dict()).tree)
                 assert Function.from_dict(expr.to_dict()) == expr.tree
+                assert expr.from_dict(expr.to_dict()).tree == expr.tree
                 print(expr.dependent_vars())
                 print(expr.assigned_vars())
                 print(expr())
